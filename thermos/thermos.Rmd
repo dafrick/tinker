@@ -1,0 +1,201 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.3.1
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+# Thermos Can Dynamics
+
+
+## 1. What I want to do and why
+Thermos cans, also called [vacuum-insulated flasks][1], are used to keep cold liquids cool or hot liquids hot. As the proud owner (and user!) of more than one such flask, I have asked myself a natural question:
+> How long will each of my flasks keep liquids hot?
+
+In fact, I would like be able to **predict the temperature of the liquid inside the flask at any time $t$** for each of my flasks, given
+* The `initial temperature` $T(0)$ (in degrees Celsius) of the liquid inside the flask
+* The `amount/volume` $V$ (in liters) of the liquid inside the flask, ideally even when that volume changes with time, e.g. $V(t)$
+* The `temperature` $T_o$ (in degrees Celsius) `outside the flask`, ideally even when that temperature changes with time, e.g. $T_o(t)$ 
+
+[1]: https://en.wikipedia.org/wiki/Vacuum_flask "Wikipedia on vacuum flasks"
+
+```{python}
+# Prerequisists
+import logging
+logging.basicConfig(level=logging.INFO)
+```
+
+## 2. The data
+
+Unfortunately, I don't have any datasheets for my flasks, so my analysis will have to rely on experimental data.
+
+I have two flasks one `black` and the other with a `metal` cover - both comparatively cheap, I got the first for free and paid about 10\\$ for the second. I collected data by filling the flasks with $V = 0.5$ liters of boiling water and placing them in an environment with (approximately) constant temperature such as (1) my living room (at about $T_o^l = 23.4\:{}^{\circ}\rm{}C$) and (2) my refrigerator (at about $T_o^r = 6.6\:{}^{\circ}\rm{}C$). The temperature of the liquid inside each flask was measured every few hours (barring time for sleep) for about 48 hours.
+
+```{python}
+from pathlib import Path
+import yaml
+import pandas as pd
+import numpy as np
+
+# Get all data files with .yaml ending
+datadir = Path('./data')
+file_list = [f for f in datadir.resolve().glob('**/*.yaml') if f.is_file()]
+logging.info('Loaded ' + str(len(file_list)) + ' files')
+
+data = pd.DataFrame()
+# Load data from files
+for file in file_list:
+    df = pd.io.json.json_normalize(yaml.safe_load(open(file)))
+    df = df.melt(id_vars=["can", "To", "fill_volume"], var_name="t", value_name="T")
+    # Add experiment name
+    df['experiment'] = file.name.rstrip('.yaml')
+    # Add T0
+    df['T0'] = np.tile(df['T'][0], len(df['T']))
+    # Clean up time and transform to time delta in seconds
+    df['t'] = df['t'].map(lambda t: t.lstrip('data.'))
+    df['t'] = pd.to_datetime(df['t'])
+    df['t'] = (df['t'] - min(df['t'])).astype('timedelta64[s]')
+    # Add loaded data frame to `data`
+    data = pd.concat([data, df], sort=False)
+logging.debug(data)
+```
+
+```{python}
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(10,6))
+experiments = data.groupby(['experiment'])
+experiments.plot(x='t', y='T', style='.:', ax=ax)
+plt.xlabel('time in seconds')
+plt.ylabel('temperature in Celsius')
+plt.legend([c[1]['experiment'].unique()[0] + ": " + c[1]['can'].unique()[0] + " (To = " + str(c[1]['To'].unique()[0]) + ")" for c in experiments])
+```
+
+### Design considerations
+
+* I chose `yaml` over `csv` (and even `json`) for the format of my experimental data because it is very _readable_ allows to _attach meta information_ to the data in a nice way. 
+* The date format was chosen to be [ISO 8601][1], since it is [the "right" date format](https://stackoverflow.com/questions/10286204/the-right-json-date-format).
+
+[1]: https://www.w3.org/TR/NOTE-datetime
+
+
+## 3. A simple model
+
+The evolution of the `temperature` $T(t)$ `of the liquid` inside the flask can be described at various levels of detail. Arguably the simplest (non-trivial!) equation that describes the evolution of $T(t)$ is
+
+$\dot{T}(t) = -C\big(T(t)-T_o(t)\big)$
+
+where $C$ is the `heat loss coefficient` of the flask.
+
+When the outside temperature is constant, i.e, $T_o(t) = T_o$, we can solve the above differential equation and say that
+
+$T(t) = T_o + \big(T(0) - T_o\big) \cdot e^{-Ct}$
+
+```{python}
+def simple_model(t, To, T0, C):
+    """Returns the temperature of the liquid inside the flask at time t
+    
+        Arguments:
+        t  -- the time in seconds
+        To -- the temperature outside the flask in degrees Celsius
+        T0 -- the temperature (in degrees Celsius) of the liquid inside the flask at t=0
+        C  -- the heat loss coefficient in 1/s
+    """
+    T = To + (T0-To)*np.exp(-t*C);
+    return T
+```
+
+### 3.1 Fitting the data
+
+#### 3.1.2 Initial guess of heat loss coefficient $C$
+The `curve_fit` function of `scipy` 
+
+We use the initializer by resolving $T(t_N) = To + \big(T(t_0) - T_o) \cdot e^{-C(t_N-t_0)}$ for $C$, where $t_N$ is the time of the last (the $N$-th) measurement.
+
+$C^0 := \frac{1}{t_N-t_0} \ln \Big( \frac{T(t_0) - T_o}{T(t_N) - T_o} \Big)$
+
+To guess the 
+
+```{python}
+import statistics
+from scipy.optimize import curve_fit
+
+def guess_heat_loss_coefficient(data: pd.DataFrame) -> float:
+    """Returns a guess of the heat loss coefficient
+
+        Arguments:
+        data -- a pandas DataFrame containing one or more sets of experiemental data
+    """
+    C0 = []
+    for c in data.groupby(['experiment']):
+        df = c[1]
+        if num_data <= 1:
+            continue
+        To = df['To'].unique()[0]
+        T0 = df['T'][0]
+        Tend = df['T'].values[-1]
+        # Initial guess for C
+        C0.append(1/(df['t'].values[-1]-df['t'][0]) * np.log((T0-To)/(Tend-To)))
+    return statistics.mean(C0)
+
+for c in data.groupby(['experiment']):
+    df = c[1]
+    num_data = len(df['t'])
+    if num_data <= 1:
+        continue
+    To = df['To'].unique()[0]
+    T0 = df['T'][0]
+    Tend = df['T'].values[-1]
+    # Initial guess for C
+    C0 = guess_heat_loss_coefficient(df)
+    x = np.column_stack((df['t'].values, df['To'].values, df['T0'].values))
+    f = lambda x, C: simple_model(x[:,0], x[:,1], x[:,2], C)
+    p = curve_fit(f, x, df['T'].values, C0)
+    C = p[0][0]
+    logging.info("Fitted C = " + str(C) + " with confidence " + str(p[1][0]) + " via initial guess C0 = " + str(C0))
+    
+    fig, ax = plt.subplots(figsize=(10,6))
+    df.plot(x='t', y='T', style='.:', ax=ax)
+    t = np.linspace(min(df['t']), max(df['t']), max(df['t'])-min(df['t']))
+    plt.plot(t, simple_model(t, To, T0, C), '-')
+    plt.xlabel('time in seconds')
+    plt.ylabel('temperature in Celsius')
+    plt.legend([df['experiment'].unique()[0] + ": " + df['can'].unique()[0] + " (To = " + str(df['To'].unique()[0]) + ")", "model with C = " + str(C)])
+    plt.show()
+    
+for c in data.groupby(['can']):
+    df = c[1]
+    num_data = len(df['t'])
+    if num_data <= 1:
+        continue
+    C0 = guess_heat_loss_coefficient(df)
+    x = np.column_stack((df['t'].values, df['To'].values, df['T0'].values))
+    f = lambda x, C: simple_model(x[:,0], x[:,1], x[:,2], C)
+    p = curve_fit(f, x, df['T'].values, C0)
+    C = p[0][0]
+    logging.info("Fitted C = " + str(C) + " with confidence " + str(p[1][0]) + " via initial guess C0 = " + str(C0))
+    
+    fig, ax = plt.subplots(figsize=(10,6))
+    legend = []
+    for c in df.groupby(['experiment']):
+        df = c[1]
+        df.plot(x='t', y='T', style='.:', ax=ax)
+        t = np.linspace(min(df['t']), max(df['t']), max(df['t'])-min(df['t']))
+        plt.plot(t, simple_model(t, df['To'].unique()[0], df['T0'].unique()[0], C), '-')
+        plt.xlabel('time in seconds')
+        plt.ylabel('temperature in Celsius')
+        legend.extend([df['experiment'].unique()[0] + ": " + df['can'].unique()[0] + " (To = " + str(df['To'].unique()[0]) + ")", "model with C = " + str(C)])
+    plt.legend(legend)
+    plt.show()
+```
+
+```{python}
+
+```
